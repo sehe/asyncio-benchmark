@@ -24,7 +24,7 @@ using Executor = asio::any_io_executor;
 auto _cout() { return std::osyncstream(std::cout); }
     #define inflog() _cout() << "I " << __FUNCTION__ << ":" << __LINE__ << " "
 #else // release
-using Executor = asio::io_context::executor_type;
+using Executor = asio::thread_pool::executor_type;
 // static thread_local std::ostream s_nullstream{nullptr};
 struct {
     template <typename T> constexpr auto& operator<<(T const&) const { return *this; }
@@ -217,6 +217,7 @@ asio::awaitable<void, Executor> stats_thread() {
 }
 
 static inline auto now() { return std::chrono::steady_clock::now(); }
+using std::this_thread::sleep_for;
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -239,16 +240,16 @@ int main(int argc, char** argv) {
         size_t const njobs     = std::stoi(argv[2]);
 
         std::vector<std::jthread> threads;
-        asio::io_context          server_ctx(ASIO_CONCURRENCY_HINT_1);
+        asio::thread_pool         server_ctx(1);
         Executor                  ex = server_ctx.get_executor();
 
         if (selection.contains("server"))
             co_spawn(ex, Server::listener(), stoppable);
 
-        server_ctx.run_for(10ms); // allow server to start
-        co_spawn(ex, stats_thread, asio::detached);
+        sleep_for(10ms); // allow server to start
+        // co_spawn(ex, stats_thread, asio::detached);
 
-        asio::io_context client_ctx(ASIO_CONCURRENCY_HINT_1);
+        asio::thread_pool client_ctx(1);
 
         if (selection.contains("asio"))
             for (size_t i = 0; i < njobs; ++i)
@@ -263,15 +264,14 @@ int main(int argc, char** argv) {
 
         errlog() << "Running " << threads.size() << " threads for " << duration << " seconds" << std::endl;
 
-        std::thread client_thread([&client_ctx] { client_ctx.run(); });
-        server_ctx.run_for(1s * duration);
+        sleep_for(1s * duration);
 
         shutdown_time = now();
         stop.emit(asio::cancellation_type::all);
         g_session_shutdown = true;
 
-        server_ctx.run(); // allow asio operations to clean up
-        client_thread.join();
+        server_ctx.join(); // allow asio operations to clean up
+        client_ctx.join();
     }
     errlog() << "Total duration: " << (now() - start) / 1.s << "s "
              << "(shutdown took " << (now() - shutdown_time) / 1ms << "ms)" << std::endl;
