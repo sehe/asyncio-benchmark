@@ -1,159 +1,263 @@
-#include <cstdint>
+// #define ASIO_ENABLE_HANDLER_TRACKING 1
+#define ASIO_NO_DEPRECATED 1
+#include <asio.hpp>
 #include <iostream>
 #include <syncstream>
-#include <vector>
-
-#include <boost/system/error_code.hpp>
-#include <asio.hpp>
-#include <numeric>
-#include <thread>
 
 using asio::ip::tcp;
-constexpr std::string host = "127.0.0.1";
-constexpr uint16_t port = 12345;
-constexpr size_t FOUR_KiB = 4 * 1024;
 
-auto info() { return std::osyncstream(std::cout); }
+constexpr std::string host     = "127.0.0.1";
+constexpr uint16_t    port     = 12345;
+constexpr size_t      FOUR_KiB = 4 * 1024;
+static std::atomic_uint64_t g_recvd = 0, g_sent = 0;
+static std::atomic_bool     g_session_shutdown = false;
 
-auto debug() { return std::osyncstream(std::cerr); }
+#ifdef NDEBUG
+#define SEHE_TWEAKS
+#endif
 
-asio::awaitable<void> send(tcp::socket socket) {
-    std::vector buf(FOUR_KiB, 'A');
-    while (true) {
-        [[maybe_unused]] auto [ec, n] =
-                co_await async_write(socket, asio::const_buffer(buf.data(), buf.size()), asio::as_tuple);
+static auto _cerr() { return std::osyncstream(std::cerr); }
+#define errlog() _cerr() << "E " << __FUNCTION__ << ":" << __LINE__ << " "
 
-        if (ec) {
-            socket.shutdown(tcp::socket::shutdown_both, ec);
-            info() << "shutdown: " << ec.message() << std::endl;
-            break;
+#ifndef SEHE_TWEAKS
+using Executor = asio::any_io_executor;
+auto _cout() { return std::osyncstream(std::cout); }
+    #define inflog() _cout() << "I " << __FUNCTION__ << ":" << __LINE__ << " "
+#else // release
+using Executor = asio::thread_pool::executor_type;
+// static thread_local std::ostream s_nullstream{nullptr};
+struct {
+    template <typename T> constexpr auto& operator<<(T const&) const { return *this; }
+    constexpr auto&                       operator<<(std::ostream& (*)(std::ostream&)) const { return *this; }
+} static constexpr s_nullstream;
+static auto& inflog() { return s_nullstream; }
+#endif
+
+namespace Client {
+    void blasio(std::stop_token stopped, Executor ex, std::atomic_uint64_t& bytesRead) try {
+        tcp::socket socket{ex};
+        {
+            tcp::resolver res{ex};
+            connect(socket, res.resolve(host, std::to_string(port)));
         }
-        // info() << "send: " << ec.message() << std::endl;
-    }
-}
 
-asio::awaitable<void> async_client(const bool &stopped, uint64_t &bytesRead) try {
-    tcp::socket socket{co_await asio::this_coro::executor};
+        std::vector<char> buf(FOUR_KiB);
+        for (asio::error_code ec; !stopped.stop_requested() && !ec;)
+            bytesRead += read(socket, asio::buffer(buf), ec);
 
-    co_await socket.async_connect({{}, port});
-
-    std::vector<char> buf(FOUR_KiB);
-    while (!stopped) {
-        auto [ec, n] = co_await async_read(
-            socket,
-            asio::mutable_buffer(buf.data(), buf.size()),
-            asio::as_tuple);
-        bytesRead += n;
-    }
-} catch (asio::system_error const &se) {
-    debug() << "read:" << se.code().message() << std::endl;
-}
-
-void blocking_client(const bool &stopped, uint64_t &bytesRead) {
-    int sockfd = -1;
-    int connection = -1;
-    addrinfo hints{};
-    addrinfo *result = nullptr;
-
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = 0; /// use default behavior
-    hints.ai_protocol = 0;
-    /// specifying 0 in this field indicates that socket addresses with any protocol can be returned by getaddrinfo();
-
-    if (const auto errorCode = getaddrinfo(host.c_str(),
-                                           std::to_string(port).c_str(),
-                                           &hints,
-                                           &result); errorCode != 0) {
-        debug() << "Failed getaddrinfo with error: " << gai_strerror(errorCode) << std::endl;
-        return;
+        asio::error_code ignore_ec;
+        socket.shutdown(tcp::socket::shutdown_both, ignore_ec);
+    } catch (asio::system_error const& se) {
+        errlog() << se.code().message() << std::endl;
     }
 
-    /// Try each address until we successfully connect
-    while (result != nullptr) {
-        sockfd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    asio::awaitable<void, Executor> asio(std::atomic_uint64_t& bytesRead) try {
+        Executor      ex = co_await asio::this_coro::executor;
+        tcp::socket   socket{ex};
+
+        tcp::resolver res{ex};
+        co_await async_connect(socket, res.resolve(host, std::to_string(port)));
+
+        for (std::vector<char> buf(FOUR_KiB);;)
+            bytesRead += co_await async_read(socket, asio::mutable_buffer(buf.data(), buf.size()));
+
+    } catch (asio::system_error const& se) {
+        errlog() << se.code().message() << std::endl;
+    }
+
+    static int blocking_connect() {
+        int      sockfd = -1;
+        addrinfo hints{};
+
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags    = 0; /// use default behavior
+        hints.ai_protocol = 0;
+        /// specifying 0 in this field indicates that socket addresses with any protocol can be
+        /// returned by ::getaddrinfo();
+
+        addrinfo* result = nullptr;
+        if (auto rc = ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result); rc != 0) {
+            errlog() << "Failed getaddrinfo with error: " << ::gai_strerror(rc) << std::endl;
+            return false;
+        }
+
+        /// Try each address until we successfully connect
+        for (auto rp = result; rp != nullptr; rp = rp->ai_next) {
+            sockfd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (sockfd == -1) {
+                rp = rp->ai_next;
+                continue;
+            }
+
+#ifndef SEHE_TWEAKS
+            constexpr static timeval Timeout{0, 100'000};
+            if (auto rc = ::setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &Timeout, sizeof(Timeout));
+                    rc == -1) {
+                errlog() << "Failed setsockopt with error: " << ::strerror(errno) << std::endl;
+            } else
+#endif
+            {
+                if (::connect(sockfd, rp->ai_addr, rp->ai_addrlen) != -1)
+                    break; /// success
+            }
+            ::close(sockfd);
+            sockfd = -1;
+        }
+        ::freeaddrinfo(result);
+
+        return sockfd;
+    }
+
+    void blocking(std::stop_token stopped, std::atomic_uint64_t& bytesRead) {
+        int sockfd = blocking_connect();
         if (sockfd == -1) {
-            result = result->ai_next;
-            continue;
+            errlog() << "Could not connect to: " << host << ":" << port << std::endl;
+            return;
         }
 
-        constexpr static timeval Timeout{0, 100'000};
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &Timeout, sizeof(Timeout));
-        connection = connect(sockfd, result->ai_addr, result->ai_addrlen);
+        std::string buf(FOUR_KiB,'\0');
 
-        if (connection != -1) {
-            break; /// success
-        }
-    }
-    freeaddrinfo(result);
-
-    if (result == nullptr) {
-        info() << "Could not connect to: " << host << ":" << port << std::endl;
-    }
-
-    std::vector<char> buf(FOUR_KiB);
-    while (!stopped) {
-        size_t numReceivedBytes = 0;
-        while (numReceivedBytes < FOUR_KiB) {
-            const ssize_t bufferSizeReceived = read(sockfd, buf.data() + numReceivedBytes,
-                                                    FOUR_KiB - numReceivedBytes);
-            numReceivedBytes += bufferSizeReceived;
-            if (bufferSizeReceived == -1) {
-                /// if read method returned -1 an error occurred during read.
-                info() << "An error occurred while reading from socket. Error: " << strerror(errno);
+        while (!stopped.stop_requested()) {
+#ifndef SEHE_TWEAKS
+            auto out = buf.data();
+            for (size_t remain = FOUR_KiB; remain;) {
+                switch (auto n = ::read(sockfd, out, remain)) {
+                    case -1:
+                        /// if read method returned -1 an error occurred during read.
+                        errlog() << "Error reading from socket: " << strerror(errno)
+                                 << std::endl;
+                        remain = 0; // stop reading
+                        break;
+                    case 0:
+                        inflog() << "EOF from " << host << ":" << port << std::endl;
+                        remain = 0; // stop reading
+                        [[fallthrough]];
+                    default:
+                        remain    -= n;
+                        out       += n;
+                        bytesRead += n;
+                }
+            }
+#else
+            if (auto n = ::read(sockfd, buf.data(), buf.size()); n > 0) {
+                bytesRead += n;
+            } else {
+                if (!n) inflog() << "EOF from " << host << ":" << port << std::endl;
+                else    errlog() << "Error reading from socket: " << strerror(errno) << std::endl;
                 break;
             }
-            if (bufferSizeReceived == 0) {
-                info() << "No data received from " << host << ":" << port;
+#endif
+        }
+
+        ::shutdown(sockfd, SHUT_RDWR);
+        ::close(sockfd);
+    }
+} // namespace Client
+
+namespace Server {
+    asio::awaitable<void, Executor> session(tcp::socket socket) try {
+        inflog() << "Connected " << socket.remote_endpoint() << std::endl;
+
+        for (static std::vector const payload(FOUR_KiB, 'A'); !g_session_shutdown;) {
+            auto [ec, n] = co_await async_write(socket, asio::buffer(payload), asio::as_tuple);
+            g_sent      += n;
+
+            if (ec) {
+                socket.shutdown(tcp::socket::shutdown_both, ec);
+                if (ec)
+                    errlog() << "shutdown: " << ec.message() << std::endl;
+                break;
             }
         }
-        bytesRead += numReceivedBytes;
+    } catch (asio::system_error const& se) {
+        errlog() << se.code().message() << std::endl;
     }
 
-    if (connection >= 0) {
-        shutdown(connection, SHUT_RDWR);
-        close(sockfd);
+    asio::awaitable<void, Executor> listener() try {
+        auto ex = co_await asio::this_coro::executor;
+
+        for (tcp::acceptor acceptor{ex, {{}, port}};;)
+            co_spawn(ex, session(co_await acceptor.async_accept()), asio::detached);
+    } catch (asio::system_error const& se) {
+        errlog() << se.code().message() << std::endl;
     }
+} // namespace Server
+
+#include <ranges> // split
+#include <set>
+#include <thread> // jthread
+using namespace std::literals;
+
+void stats(int elapsed_seconds) {
+    errlog() << " -- " << std::endl;
+    if (g_recvd)
+        errlog() << "Total bytes read: " << g_recvd << " "                             //
+                 << (g_recvd / 1024.0 / 1024.0 / 1024.0 / elapsed_seconds) << " GiB/s" //
+                 << std::endl;
+    if (g_sent)
+        errlog() << "Total bytes sent: " << g_sent << " "                             //
+                 << (g_sent / 1024.0 / 1024.0 / 1024.0 / elapsed_seconds) << " GiB/s" //
+                 << std::endl;
 }
 
-asio::awaitable<void> listener(const int num_connections) try {
-    const auto executor = co_await asio::this_coro::executor;
-    tcp::acceptor acceptor{executor, {{}, port}};
-    for (int i = 0; i < num_connections; ++i) {
-        co_spawn(executor, send(co_await acceptor.async_accept()), asio::detached);
+using std::this_thread::sleep_for;
+static inline auto now() { return std::chrono::steady_clock::now(); }
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " [server|asio|blasio|blocking],... numConnections duration" << std::endl;
+        return 1;
     }
-} catch (asio::system_error const &se) {
-    debug() << "listener: " << se.code().message() << std::endl;
-}
 
-int main(const int argc, char **argv) {
-    asio::thread_pool ioc;
-    const int numConnections = std::stoi(argv[2]);
-    std::vector<uint64_t> bytesRead(numConnections, 0);
+    auto selection = [&] {
+        auto rr = std::views::split(std::string_view(argv[1]), ',');
+        return std::set<std::string_view>(rr.begin(), rr.end());
+    }();
 
-    if (const std::string executable = argv[1]; executable == "s") {
-        co_spawn(ioc, listener(numConnections), asio::detached);
-    } else {
-        const int duration = std::stoi(argv[3]);
-        bool stopped = false;
+    auto const duration = std::max(1, std::stoi(argv[3]));
 
-        if (executable == "ac") {
-            for (int i = 0; i < numConnections; ++i) {
-                co_spawn(ioc, async_client(stopped, bytesRead.at(i)), asio::detached);
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(duration));
-            stopped = true;
-        } else if (executable == "bc") {
-            std::vector<std::jthread> threads;
-            threads.reserve(numConnections);
-            for (int i = 0; i < numConnections; ++i) {
-                threads.emplace_back(blocking_client, std::ref(stopped), std::ref(bytesRead.at(i)));
-            }
+    auto start = now(), shutdown_time = start;
+    {
+        asio::cancellation_signal stop;
 
-            std::this_thread::sleep_for(std::chrono::seconds(duration));
-            stopped = true;
+        auto         stoppable = asio::bind_cancellation_slot(stop.slot(), asio::detached);
+        size_t const njobs     = std::stoi(argv[2]);
+
+        std::vector<std::jthread> threads;
+        asio::thread_pool         ioc;
+        Executor                  ex = ioc.get_executor();
+
+        if (selection.contains("server"))
+            co_spawn(ex, Server::listener(), stoppable);
+
+        sleep_for(10ms); // allow server to start
+
+        if (selection.contains("asio"))
+            for (size_t i = 0; i < njobs; ++i)
+                co_spawn(ex, Client::asio(g_recvd), stoppable);
+        if (selection.contains("blocking"))
+            generate_n(back_inserter(threads), njobs,
+                       [&] { return std::jthread(Client::blocking, std::ref(g_recvd)); });
+        if (selection.contains("blasio"))
+            generate_n(back_inserter(threads), njobs,
+                       [&] { return std::jthread(Client::blasio, ex, std::ref(g_recvd)); });
+
+        errlog() << "Running " << threads.size() << " threads for " << duration << " seconds" << std::endl;
+
+        for (int i = 0; i < duration; ++i) {
+            if (i)
+                stats(i);
+            sleep_for(1s);
         }
-        info() << "Total bytes read: " << std::accumulate(bytesRead.begin(), bytesRead.end(), 0ULL) << std::endl;
+
+        shutdown_time = now();
+        stop.emit(asio::cancellation_type::all);
+        g_session_shutdown = true;
+        ioc.join(); // allow asio operations to clean up
     }
-    ioc.join();
+    errlog() << "Total duration: " << (now() - start) / 1.s << "s "
+             << "(shutdown took " << (now() - shutdown_time) / 1ms << "ms)" << std::endl;
+
+    stats(duration);
 }
