@@ -239,17 +239,27 @@ int main(int argc, char** argv) {
         auto         stoppable = asio::bind_cancellation_slot(stop.slot(), asio::detached);
         size_t const njobs     = std::stoi(argv[2]);
 
+        asio::thread_pool         server_ctx(0), client_ctx(0);
         std::vector<std::jthread> threads;
-        asio::thread_pool         server_ctx(4);
-        Executor                  ex = server_ctx.get_executor();
+
+        auto populate = [&threads](auto& pool, unsigned n) {
+            while (n--)
+                threads.emplace_back([&pool, i = threads.size()] {
+                    cpu_set_t core{1ul << i};
+                    pthread_setaffinity_np(pthread_self(), sizeof(core), &core);
+                    pool.attach();
+                });
+        };
+        populate(server_ctx, 4);
+        populate(client_ctx, 4);
+
+        Executor ex = server_ctx.get_executor();
 
         if (selection.contains("server"))
             co_spawn(ex, Server::listener(), stoppable);
 
         sleep_for(10ms); // allow server to start
         // co_spawn(ex, stats_thread, asio::detached);
-
-        asio::thread_pool client_ctx(4);
 
         if (selection.contains("asio"))
             for (size_t i = 0; i < njobs; ++i)
