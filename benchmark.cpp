@@ -1,3 +1,7 @@
+#ifdef NDEBUG
+#define SEHE_TWEAKS
+#endif
+
 // #define ASIO_ENABLE_HANDLER_TRACKING 1
 #define ASIO_NO_DEPRECATED 1
 #include <asio.hpp>
@@ -12,10 +16,6 @@ constexpr size_t      FOUR_KiB = 4 * 1024;
 static std::atomic_uint64_t g_recvd = 0, g_sent = 0;
 static std::atomic_bool     g_session_shutdown = false;
 
-#ifdef NDEBUG
-#define SEHE_TWEAKS
-#endif
-
 static auto _cerr() { return std::osyncstream(std::cerr); }
 #define errlog() _cerr() << "E " << __FUNCTION__ << ":" << __LINE__ << " "
 
@@ -24,7 +24,7 @@ using Executor = asio::any_io_executor;
 auto _cout() { return std::osyncstream(std::cout); }
     #define inflog() _cout() << "I " << __FUNCTION__ << ":" << __LINE__ << " "
 #else // release
-using Executor = asio::thread_pool::executor_type;
+using Executor = asio::io_context::executor_type;
 // static thread_local std::ostream s_nullstream{nullptr};
 struct {
     template <typename T> constexpr auto& operator<<(T const&) const { return *this; }
@@ -48,7 +48,10 @@ namespace Client {
         asio::error_code ignore_ec;
         socket.shutdown(tcp::socket::shutdown_both, ignore_ec);
     } catch (asio::system_error const& se) {
-        errlog() << se.code().message() << std::endl;
+        if (se.code() != asio::error::eof)
+            errlog() << se.code().message() << std::endl;
+        else
+            inflog() << "EOF from " << host << ":" << port << std::endl;
     }
 
     asio::awaitable<void, Executor> asio(std::atomic_uint64_t& bytesRead) try {
@@ -62,7 +65,10 @@ namespace Client {
             bytesRead += co_await async_read(socket, asio::mutable_buffer(buf.data(), buf.size()));
 
     } catch (asio::system_error const& se) {
-        errlog() << se.code().message() << std::endl;
+        if (se.code() != asio::error::eof)
+            errlog() << se.code().message() << std::endl;
+        else
+            inflog() << "EOF from " << host << ":" << port << std::endl;
     }
 
     static int blocking_connect() {
@@ -201,7 +207,15 @@ void stats(int elapsed_seconds) {
                  << std::endl;
 }
 
-using std::this_thread::sleep_for;
+asio::awaitable<void, Executor> stats_thread() {
+    Executor ex = co_await asio::this_coro::executor;
+    for (int i = 0; !g_session_shutdown; ++i) {
+        if (i)
+            stats(i);
+        co_await asio::steady_timer(ex, 1s).async_wait();
+    }
+}
+
 static inline auto now() { return std::chrono::steady_clock::now(); }
 
 int main(int argc, char** argv) {
@@ -225,36 +239,39 @@ int main(int argc, char** argv) {
         size_t const njobs     = std::stoi(argv[2]);
 
         std::vector<std::jthread> threads;
-        asio::thread_pool         ioc;
-        Executor                  ex = ioc.get_executor();
+        asio::io_context          server_ctx(ASIO_CONCURRENCY_HINT_1);
+        Executor                  ex = server_ctx.get_executor();
 
         if (selection.contains("server"))
             co_spawn(ex, Server::listener(), stoppable);
 
-        sleep_for(10ms); // allow server to start
+        server_ctx.run_for(10ms); // allow server to start
+        co_spawn(ex, stats_thread, asio::detached);
+
+        asio::io_context client_ctx(ASIO_CONCURRENCY_HINT_1);
 
         if (selection.contains("asio"))
             for (size_t i = 0; i < njobs; ++i)
-                co_spawn(ex, Client::asio(g_recvd), stoppable);
+                co_spawn(client_ctx, Client::asio(g_recvd), asio::detached);
         if (selection.contains("blocking"))
             generate_n(back_inserter(threads), njobs,
                        [&] { return std::jthread(Client::blocking, std::ref(g_recvd)); });
         if (selection.contains("blasio"))
-            generate_n(back_inserter(threads), njobs,
-                       [&] { return std::jthread(Client::blasio, ex, std::ref(g_recvd)); });
+            generate_n(back_inserter(threads), njobs, [&] {
+                return std::jthread(Client::blasio, client_ctx.get_executor(), std::ref(g_recvd));
+            });
 
         errlog() << "Running " << threads.size() << " threads for " << duration << " seconds" << std::endl;
 
-        for (int i = 0; i < duration; ++i) {
-            if (i)
-                stats(i);
-            sleep_for(1s);
-        }
+        std::thread client_thread([&client_ctx] { client_ctx.run(); });
+        server_ctx.run_for(1s * duration);
 
         shutdown_time = now();
         stop.emit(asio::cancellation_type::all);
         g_session_shutdown = true;
-        ioc.join(); // allow asio operations to clean up
+
+        server_ctx.run(); // allow asio operations to clean up
+        client_thread.join();
     }
     errlog() << "Total duration: " << (now() - start) / 1.s << "s "
              << "(shutdown took " << (now() - shutdown_time) / 1ms << "ms)" << std::endl;
