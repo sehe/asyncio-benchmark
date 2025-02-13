@@ -1,9 +1,13 @@
 #!/bin/env bash
-for base in server server,affinity; do
-    for numclients in 1 10 100 1000; do
-        for duration in 1 2 3; do
-            for client in asio blasio blocking; do
-                echo "$base,$client $numclients $duration"
+for serverThreads in 3 4; do
+    for clientThreads in 3 4; do
+        for opts in '' affinity; do
+            for numclients in 32 320; do
+                for duration in 2; do
+                    for client in asio blasio blocking; do
+                        echo "server,$opts,$client $numclients $duration $serverThreads $clientThreads"
+                    done
+                done
             done
         done
     done
