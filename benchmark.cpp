@@ -186,10 +186,15 @@ namespace Server {
         for (tcp::acceptor acceptor{ex, {{}, port}};;)
             co_spawn(ex, session(co_await acceptor.async_accept()), asio::detached);
     } catch (asio::system_error const& se) {
-        errlog() << se.code().message() << std::endl;
+        if (se.code() != asio::error::operation_aborted)
+            errlog() << se.code().message() << std::endl;
+        else
+            inflog() << se.code().message() << std::endl;
     }
 } // namespace Server
 
+#include <fstream>
+#include <iomanip>
 #include <ranges> // split
 #include <set>
 #include <thread> // jthread
@@ -219,62 +224,111 @@ asio::awaitable<void, Executor> stats_thread() {
 static inline auto now() { return std::chrono::steady_clock::now(); }
 using std::this_thread::sleep_for;
 
-int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " [server|asio|blasio|blocking],... numConnections duration" << std::endl;
-        return 1;
+struct Config {
+    std::string what          = "error";
+    int         numClients    = 1;
+    int         duration      = 1;
+
+    friend std::istream& operator>>(std::istream& is, Config& cfg) {
+        if (is >> cfg.what >> cfg.numClients >> cfg.duration) {
+            auto rr = std::views::split(cfg.what, ',') |
+                std::views::transform([](auto sv) { return std::string(sv.begin(), sv.end()); });
+            std::set selection(rr.begin(), rr.end());
+            cfg.duration  = std::max(1, cfg.duration);
+            cfg.affinity  = selection.contains("affinity");
+            cfg.server    = selection.contains("server");
+            selection.erase("affinity");
+            selection.erase("server");
+
+            if (selection.size() == 1) {
+                cfg.what = *selection.begin();
+                return is;
+            }
+
+            errlog() << " -- Invalid selection: " << quoted(cfg.what) << std::endl;
+        }
+        is.setstate(std::ios::failbit);
+        return is;
     }
 
-    auto selection = [&] {
-        auto rr = std::views::split(std::string_view(argv[1]), ',');
-        return std::set<std::string_view>(rr.begin(), rr.end());
-    }();
+    bool server, affinity;
+    int  serverThreads = 1;
+    int  clientThreads = 1;
+};
 
-    auto const duration = std::max(1, std::stoi(argv[3]));
+static auto readConfigs() {
+    std::vector<Config> results;
+    for (std::string line; getline(std::cin, line);) {
+        if (Config cfg; std::istringstream(line) >> cfg) {
+            results.push_back(std::move(cfg));
+        } else {
+            errlog() << "Parse error, expecting [affinity|server|asio|blasio|blocking],… numClients duration"
+                     << std::endl;
+            ::exit(1);
+        }
+    }
+    return results;
+}
 
+using Csv = std::vector<std::vector<std::string>>;
+
+void run_bench(Config const& cfg, Csv& output) {
     auto start = now(), shutdown_time = start;
     {
+        g_recvd = g_sent   = 0;
+        g_session_shutdown = false;
         asio::cancellation_signal stop;
 
         auto         stoppable = asio::bind_cancellation_slot(stop.slot(), asio::detached);
-        size_t const njobs     = std::stoi(argv[2]);
+        size_t const njobs     = cfg.numClients;
 
         asio::thread_pool         server_ctx(0), client_ctx(0);
         std::vector<std::jthread> threads;
 
-        auto populate = [&threads](auto& pool, unsigned n) {
+        auto populate = [&cfg, &threads](auto& pool, unsigned n) {
             while (n--)
-                threads.emplace_back([&pool, i = threads.size()] {
+                threads.emplace_back([&cfg, &pool, i = threads.size()] {
                     cpu_set_t core{1ul << i};
-                    pthread_setaffinity_np(pthread_self(), sizeof(core), &core);
+                    if (cfg.affinity)
+                        if (auto rc = pthread_setaffinity_np(pthread_self(), sizeof(core), &core))
+                            errlog() << "Failed to set affinity(" << i << "): " << strerror(rc) << std::endl;
                     pool.attach();
                 });
         };
-        populate(server_ctx, 4);
-        populate(client_ctx, 4);
+        populate(server_ctx, cfg.serverThreads);
+        populate(client_ctx, cfg.clientThreads);
 
-        Executor ex = server_ctx.get_executor();
+        if (cfg.server)
+            co_spawn(server_ctx, Server::listener(), stoppable);
 
-        if (selection.contains("server"))
-            co_spawn(ex, Server::listener(), stoppable);
+        sleep_for(1ms); // allow server to start
 
-        sleep_for(10ms); // allow server to start
-        // co_spawn(ex, stats_thread, asio::detached);
+        start = now(); // update start time for more precise coverage
+                       // co_spawn(ex, stats_thread, asio::detached);
 
-        if (selection.contains("asio"))
+        if (cfg.what == "asio")
             for (size_t i = 0; i < njobs; ++i)
                 co_spawn(client_ctx, Client::asio(g_recvd), asio::detached);
-        if (selection.contains("blocking"))
+        else if (cfg.what == "blocking")
             generate_n(back_inserter(threads), njobs,
                        [&] { return std::jthread(Client::blocking, std::ref(g_recvd)); });
-        if (selection.contains("blasio"))
+        else if (cfg.what == "blasio")
             generate_n(back_inserter(threads), njobs, [&] {
                 return std::jthread(Client::blasio, client_ctx.get_executor(), std::ref(g_recvd));
             });
+        else {
+            errlog() << "Unknown selection: " << quoted(cfg.what) << std::endl;
+            ::exit(1);
+        }
 
-        errlog() << "Running " << threads.size() << " threads for " << duration << " seconds" << std::endl;
+        errlog()                                                                                           //
+            << "Running "                                                                                  //
+            << cfg.numClients << "x" << cfg.what                                                           //
+            << " with " << cfg.serverThreads << "+" << cfg.clientThreads << " (" << threads.size() << ") " //
+            << (cfg.affinity ? "affine threads" : "threads")                                               //
+            << " for " << cfg.duration << " seconds" << std::endl;
 
-        sleep_for(1s * duration);
+        sleep_for(1s * cfg.duration);
 
         shutdown_time = now();
         stop.emit(asio::cancellation_type::all);
@@ -283,8 +337,45 @@ int main(int argc, char** argv) {
         server_ctx.join(); // allow asio operations to clean up
         client_ctx.join();
     }
-    errlog() << "Total duration: " << (now() - start) / 1.s << "s "
-             << "(shutdown took " << (now() - shutdown_time) / 1ms << "ms)" << std::endl;
+    auto finish = now();
+    errlog() << "Total duration: " << (finish - start) / 1.s << "s "
+             << "(shutdown took " << (finish - shutdown_time) / 1ms << "ms)" << std::endl;
 
-    stats(duration);
+    errlog() << "Stats for " << cfg.serverThreads << "+" << cfg.clientThreads << " "
+             << (g_recvd / 1.0 / 1024 / 1024 / 1024 / cfg.duration) << " GiB/s" << std::endl;
+
+    if (output.empty())
+        output.push_back(
+            {"selection", "affinity", "numClients", "serverThreads", "clientThreads", "duration", "recv GiB/s"});
+
+    output.push_back({
+        cfg.what,
+        cfg.affinity ? "true" : "false",
+        std::to_string(cfg.numClients),
+        std::to_string(cfg.serverThreads),
+        std::to_string(cfg.clientThreads),
+        std::to_string(cfg.duration),
+        std::to_string(g_recvd / 1.0 / 1024 / 1024 / 1024 / cfg.duration),
+    });
+    // stats(duration);
+}
+
+int main() {
+    std::cout << std::boolalpha, std::cerr << std::boolalpha, std::clog << std::boolalpha;
+
+    Csv output;
+    for (auto /*const&*/ cfg : readConfigs())
+        for (auto ct : {1, 2, 3, 4, 5})
+            for (auto st : {1, 2, 3, 4, 5}) {
+                cfg.clientThreads = ct;
+                cfg.serverThreads = st;
+                run_bench(cfg, output);
+            }
+
+    std::ofstream ofs("results.csv");
+    for (auto const& columns : output) {
+        for (auto sep=""; auto const& cell : columns)
+            ofs << std::exchange(sep, ",") << std::quoted(cell);
+        ofs << '\n';
+    }
 }
