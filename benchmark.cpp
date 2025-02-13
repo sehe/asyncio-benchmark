@@ -1,7 +1,3 @@
-#ifdef NDEBUG
-#define SEHE_TWEAKS
-#endif
-
 // #define ASIO_ENABLE_HANDLER_TRACKING 1
 #define ASIO_NO_DEPRECATED 1
 #include <asio.hpp>
@@ -10,31 +6,52 @@
 
 using asio::ip::tcp;
 
-constexpr std::string host     = "127.0.0.1";
-constexpr uint16_t    port     = 12345;
-constexpr size_t      FOUR_KiB = 4 * 1024;
-static std::atomic_uint64_t g_recvd = 0, g_sent = 0;
-static std::atomic_bool     g_session_shutdown = false;
+constexpr std::string       host     = "127.0.0.1";
+constexpr uint16_t          port     = 12345;
+constexpr size_t            FOUR_KiB = 4 * 1024;
 
-static auto _cerr() { return std::osyncstream(std::cerr); }
-#define errlog() _cerr() << "E " << __FUNCTION__ << ":" << __LINE__ << " "
+#define errlog() std::osyncstream(std::cerr) << "E " << __FUNCTION__ << ":" << __LINE__ << " "
 
-#ifndef SEHE_TWEAKS
-using Executor = asio::any_io_executor;
-auto _cout() { return std::osyncstream(std::cout); }
-    #define inflog() _cout() << "I " << __FUNCTION__ << ":" << __LINE__ << " "
-#else // release
 using Executor = asio::thread_pool::executor_type;
+#ifdef NDEBUG
 // static thread_local std::ostream s_nullstream{nullptr};
 struct {
     template <typename T> constexpr auto& operator<<(T const&) const { return *this; }
     constexpr auto&                       operator<<(std::ostream& (*)(std::ostream&)) const { return *this; }
 } static constexpr s_nullstream;
 static auto& inflog() { return s_nullstream; }
+#else
+#define inflog() std::osyncstream(std::cout) << "I " << __FUNCTION__ << ":" << __LINE__ << " "
 #endif
 
+struct Stats {
+    std::atomic_uint64_t recvd          = 0;
+    std::atomic_uint64_t sent           = 0;
+    std::atomic_uint64_t clients        = 0;
+    std::atomic_uint64_t failed_clients = 0;
+
+    void reset() { recvd = sent = clients = failed_clients = 0; }
+
+    void report(int elapsed_seconds) const {
+        errlog() << " -- " << std::endl;
+        if (recvd)
+            errlog() << "Total bytes read: " << recvd << " "                             //
+                << (recvd / 1024.0 / 1024.0 / 1024.0 / elapsed_seconds) << " GiB/s" //
+                << std::endl;
+        if (sent)
+            errlog() << "Total bytes sent: " << sent << " "                             //
+                << (sent / 1024.0 / 1024.0 / 1024.0 / elapsed_seconds) << " GiB/s" //
+                << std::endl;
+        if (failed_clients)
+            errlog() << "Failed clients: " << failed_clients << std::endl;
+    }
+
+} static g_stats;
+static std::atomic_bool g_session_shutdown = false;
+
 namespace Client {
-    void blasio(std::stop_token stopped, Executor ex, std::atomic_uint64_t& bytesRead) try {
+    void blasio(std::stop_token stopped, Executor ex) try {
+        g_stats.clients += 1;
         tcp::socket socket{ex};
         {
             tcp::resolver res{ex};
@@ -43,18 +60,20 @@ namespace Client {
 
         std::vector<char> buf(FOUR_KiB);
         for (asio::error_code ec; !stopped.stop_requested() && !ec;)
-            bytesRead += read(socket, asio::buffer(buf), ec);
+            g_stats.recvd += read(socket, asio::buffer(buf), ec);
 
         asio::error_code ignore_ec;
         socket.shutdown(tcp::socket::shutdown_both, ignore_ec);
     } catch (asio::system_error const& se) {
-        if (se.code() != asio::error::eof)
+        if (se.code() != asio::error::eof) {
+            g_stats.failed_clients += 1;
             errlog() << se.code().message() << std::endl;
-        else
+        } else
             inflog() << "EOF from " << host << ":" << port << std::endl;
     }
 
-    asio::awaitable<void, Executor> asio(std::atomic_uint64_t& bytesRead) try {
+    asio::awaitable<void, Executor> asio() try {
+        g_stats.clients += 1;
         Executor      ex = co_await asio::this_coro::executor;
         tcp::socket   socket{ex};
 
@@ -62,12 +81,13 @@ namespace Client {
         co_await async_connect(socket, res.resolve(host, std::to_string(port)));
 
         for (std::vector<char> buf(FOUR_KiB);;)
-            bytesRead += co_await async_read(socket, asio::mutable_buffer(buf.data(), buf.size()));
+            g_stats.recvd += co_await async_read(socket, asio::mutable_buffer(buf.data(), buf.size()));
 
     } catch (asio::system_error const& se) {
-        if (se.code() != asio::error::eof)
+        if (se.code() != asio::error::eof) {
+            g_stats.failed_clients += 1;
             errlog() << se.code().message() << std::endl;
-        else
+        } else
             inflog() << "EOF from " << host << ":" << port << std::endl;
     }
 
@@ -96,13 +116,11 @@ namespace Client {
                 continue;
             }
 
-#ifndef SEHE_TWEAKS
-            constexpr static timeval Timeout{0, 100'000};
-            if (auto rc = ::setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &Timeout, sizeof(Timeout));
-                    rc == -1) {
-                errlog() << "Failed setsockopt with error: " << ::strerror(errno) << std::endl;
-            } else
-#endif
+            // constexpr static timeval Timeout{0, 100'000};
+            // if (auto rc = ::setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &Timeout, sizeof(Timeout));
+            // rc == -1) {
+            // errlog() << "Failed setsockopt with error: " << ::strerror(errno) << std::endl;
+            //} else
             {
                 if (::connect(sockfd, rp->ai_addr, rp->ai_addrlen) != -1)
                     break; /// success
@@ -115,45 +133,29 @@ namespace Client {
         return sockfd;
     }
 
-    void blocking(std::stop_token stopped, std::atomic_uint64_t& bytesRead) {
+    void blocking(std::stop_token stopped) {
+        g_stats.clients += 1;
         int sockfd = blocking_connect();
         if (sockfd == -1) {
             errlog() << "Could not connect to: " << host << ":" << port << std::endl;
+            g_stats.failed_clients += 1;
             return;
         }
 
         std::string buf(FOUR_KiB,'\0');
 
         while (!stopped.stop_requested()) {
-#ifndef SEHE_TWEAKS
-            auto out = buf.data();
-            for (size_t remain = FOUR_KiB; remain;) {
-                switch (auto n = ::read(sockfd, out, remain)) {
-                    case -1:
-                        /// if read method returned -1 an error occurred during read.
-                        errlog() << "Error reading from socket: " << strerror(errno)
-                                 << std::endl;
-                        remain = 0; // stop reading
-                        break;
-                    case 0:
-                        inflog() << "EOF from " << host << ":" << port << std::endl;
-                        remain = 0; // stop reading
-                        [[fallthrough]];
-                    default:
-                        remain    -= n;
-                        out       += n;
-                        bytesRead += n;
-                }
-            }
-#else
             if (auto n = ::read(sockfd, buf.data(), buf.size()); n > 0) {
-                bytesRead += n;
+                g_stats.recvd += n;
             } else {
-                if (!n) inflog() << "EOF from " << host << ":" << port << std::endl;
-                else    errlog() << "Error reading from socket: " << strerror(errno) << std::endl;
+                if (!n) {
+                    inflog() << "EOF from " << host << ":" << port << std::endl;
+                } else {
+                    errlog() << "Error reading from socket: " << strerror(errno) << std::endl;
+                    g_stats.failed_clients += 1;
+                }
                 break;
             }
-#endif
         }
 
         ::shutdown(sockfd, SHUT_RDWR);
@@ -167,7 +169,7 @@ namespace Server {
 
         for (static std::vector const payload(FOUR_KiB, 'A'); !g_session_shutdown;) {
             auto [ec, n] = co_await async_write(socket, asio::buffer(payload), asio::as_tuple);
-            g_sent      += n;
+            g_stats.sent      += n;
 
             if (ec) {
                 socket.shutdown(tcp::socket::shutdown_both, ec);
@@ -186,9 +188,10 @@ namespace Server {
         for (tcp::acceptor acceptor{ex, {{}, port}};;)
             co_spawn(ex, session(co_await acceptor.async_accept()), asio::detached);
     } catch (asio::system_error const& se) {
-        if (se.code() != asio::error::operation_aborted)
+        if (se.code() != asio::error::operation_aborted) {
+            std::exit(1);
             errlog() << se.code().message() << std::endl;
-        else
+        } else
             inflog() << se.code().message() << std::endl;
     }
 } // namespace Server
@@ -200,23 +203,11 @@ namespace Server {
 #include <thread> // jthread
 using namespace std::literals;
 
-void stats(int elapsed_seconds) {
-    errlog() << " -- " << std::endl;
-    if (g_recvd)
-        errlog() << "Total bytes read: " << g_recvd << " "                             //
-                 << (g_recvd / 1024.0 / 1024.0 / 1024.0 / elapsed_seconds) << " GiB/s" //
-                 << std::endl;
-    if (g_sent)
-        errlog() << "Total bytes sent: " << g_sent << " "                             //
-                 << (g_sent / 1024.0 / 1024.0 / 1024.0 / elapsed_seconds) << " GiB/s" //
-                 << std::endl;
-}
-
 asio::awaitable<void, Executor> stats_thread() {
     Executor ex = co_await asio::this_coro::executor;
     for (int i = 0; !g_session_shutdown; ++i) {
         if (i)
-            stats(i);
+            g_stats.report(i);
         co_await asio::steady_timer(ex, 1s).async_wait();
     }
 }
@@ -230,13 +221,18 @@ struct Config {
     int         duration      = 1;
 
     friend std::istream& operator>>(std::istream& is, Config& cfg) {
-        if (is >> cfg.what >> cfg.numClients >> cfg.duration) {
+        if (is                                                                                          //
+                >> cfg.what >> cfg.numClients >> cfg.duration >> cfg.serverThreads >> cfg.clientThreads //
+                >> std::skipws &&
+            is.rdbuf()->in_avail() == 0) //
+        {
             auto rr = std::views::split(cfg.what, ',') |
                 std::views::transform([](auto sv) { return std::string(sv.begin(), sv.end()); });
             std::set selection(rr.begin(), rr.end());
             cfg.duration  = std::max(1, cfg.duration);
             cfg.affinity  = selection.contains("affinity");
             cfg.server    = selection.contains("server");
+            selection.erase("");
             selection.erase("affinity");
             selection.erase("server");
 
@@ -262,7 +258,8 @@ static auto readConfigs() {
         if (Config cfg; std::istringstream(line) >> cfg) {
             results.push_back(std::move(cfg));
         } else {
-            errlog() << "Parse error, expecting [affinity|server|asio|blasio|blocking],… numClients duration"
+            errlog() << "Parse error, expecting [affinity|server|asio|blasio|blocking],… numClients duration "
+                        "serverThreads clientThreads"
                      << std::endl;
             ::exit(1);
         }
@@ -275,7 +272,7 @@ using Csv = std::vector<std::vector<std::string>>;
 void run_bench(Config const& cfg, Csv& output) {
     auto start = now(), shutdown_time = start;
     {
-        g_recvd = g_sent   = 0;
+        g_stats.reset();
         g_session_shutdown = false;
         asio::cancellation_signal stop;
 
@@ -308,13 +305,13 @@ void run_bench(Config const& cfg, Csv& output) {
 
         if (cfg.what == "asio")
             for (size_t i = 0; i < njobs; ++i)
-                co_spawn(client_ctx, Client::asio(g_recvd), asio::detached);
+                co_spawn(client_ctx, Client::asio, asio::detached);
         else if (cfg.what == "blocking")
             generate_n(back_inserter(threads), njobs,
-                       [&] { return std::jthread(Client::blocking, std::ref(g_recvd)); });
+                       [&] { return std::jthread(Client::blocking); });
         else if (cfg.what == "blasio")
             generate_n(back_inserter(threads), njobs, [&] {
-                return std::jthread(Client::blasio, client_ctx.get_executor(), std::ref(g_recvd));
+                return std::jthread(Client::blasio, client_ctx.get_executor());
             });
         else {
             errlog() << "Unknown selection: " << quoted(cfg.what) << std::endl;
@@ -342,11 +339,22 @@ void run_bench(Config const& cfg, Csv& output) {
              << "(shutdown took " << (finish - shutdown_time) / 1ms << "ms)" << std::endl;
 
     errlog() << "Stats for " << cfg.serverThreads << "+" << cfg.clientThreads << " "
-             << (g_recvd / 1.0 / 1024 / 1024 / 1024 / cfg.duration) << " GiB/s" << std::endl;
+             << (g_stats.recvd / 1.0 / 1024 / 1024 / 1024 / cfg.duration) << " GiB/s" << std::endl;
 
     if (output.empty())
-        output.push_back(
-            {"selection", "affinity", "numClients", "serverThreads", "clientThreads", "duration", "recv GiB/s"});
+        output.push_back({
+            "selection",
+            "affinity",
+            "numClients",
+            "serverThreads",
+            "clientThreads",
+            "duration",
+            "recv GiB/s",
+            "sent GiB/s",
+            "clients",
+            "failed",
+            "failed %",
+        });
 
     output.push_back({
         cfg.what,
@@ -355,22 +363,21 @@ void run_bench(Config const& cfg, Csv& output) {
         std::to_string(cfg.serverThreads),
         std::to_string(cfg.clientThreads),
         std::to_string(cfg.duration),
-        std::to_string(g_recvd / 1.0 / 1024 / 1024 / 1024 / cfg.duration),
+        std::to_string(g_stats.recvd / 1.0 / 1024 / 1024 / 1024 / cfg.duration),
+        std::to_string(g_stats.sent / 1.0 / 1024 / 1024 / 1024 / cfg.duration),
+        std::to_string(g_stats.clients),
+        std::to_string(g_stats.failed_clients),
+        std::to_string(g_stats.clients ? 100.0 * g_stats.failed_clients / g_stats.clients : 0),
     });
-    // stats(duration);
+    // g_stats.report(cfg.duration);
 }
 
 int main() {
     std::cout << std::boolalpha, std::cerr << std::boolalpha, std::clog << std::boolalpha;
 
     Csv output;
-    for (auto /*const&*/ cfg : readConfigs())
-        for (auto ct : {1, 2, 3, 4, 5})
-            for (auto st : {1, 2, 3, 4, 5}) {
-                cfg.clientThreads = ct;
-                cfg.serverThreads = st;
-                run_bench(cfg, output);
-            }
+    for (auto const& cfg : readConfigs())
+        run_bench(cfg, output);
 
     std::ofstream ofs("results.csv");
     for (auto const& columns : output) {
